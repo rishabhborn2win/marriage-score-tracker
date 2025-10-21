@@ -114,6 +114,10 @@ const App = () => {
     // --- INPUT STATE (for new round entry) ---
     const [showedPlayerIndex, setShowedPlayerIndex] = useState(0);
     const [roundInputs, setRoundInputs] = useState({});
+    
+    // NEW STATE: Tracks which players are inactive for the current round
+    const [inactivePlayers, setInactivePlayers] = useState([]);
+
 
     // 0. Persist states to localStorage (Runs on view or activeGameId change)
     useEffect(() => {
@@ -206,10 +210,10 @@ const App = () => {
                 }), {});
                 setRoundInputs(newInputs);
                 
-                // Ensure showedPlayerIndex is valid
-                if (showedPlayerIndex >= gameData.playerNames.length) {
-                    setShowedPlayerIndex(0);
-                }
+                // Reset showed player and inactive list when game data loads
+                setShowedPlayerIndex(0);
+                setInactivePlayers([]); 
+
                 setMessage('');
                 
                 // Ensure view is set to gameplay if data is successfully loaded
@@ -256,30 +260,66 @@ const App = () => {
 
         return () => unsubscribe();
     }, [db, isAuthReady, activeGameId, appId]);
+    
+    // --- Player Status Toggle ---
+    const toggleInactive = (name) => {
+        setInactivePlayers(prev => 
+            prev.includes(name) 
+                ? prev.filter(n => n !== name) // Remove if active
+                : [...prev, name]             // Add if inactive
+        );
+        // Reset inputs for the toggled player just in case
+        setRoundInputs(prev => ({
+             ...prev,
+             [name]: { power: 0, hands: 0 }
+        }));
+    };
 
     // --- Core Calculation Logic ---
     const calculateRoundScores = useCallback(() => {
         if (!currentGame) return {};
 
         const { playerNames, perPointValue } = currentGame;
-        const numPlayers = playerNames.length;
         
-        // Calculate total power contributed by all players in this round
-        const totalPower = playerNames.reduce((sum, name) => sum + (roundInputs[name]?.power || 0), 0);
+        // Filter out inactive players for this round's calculation
+        const activePlayerNames = playerNames.filter(name => !inactivePlayers.includes(name));
+        const numPlayers = activePlayerNames.length;
         
-        let netValues = 0; // Tracks the total loss incurred by non-showed players
+        // Find the index of the showed player within the FULL playerNames list
+        const showedPlayerName = playerNames[showedPlayerIndex];
+        
+        // Check if the showed player is active
+        const isShowedPlayerActive = activePlayerNames.includes(showedPlayerName);
+
+        // If the intended showed player is inactive, we can't calculate a valid round.
+        if (!isShowedPlayerActive) {
+            // Assign 0 to all players and return (or handle error)
+            return playerNames.reduce((acc, name) => ({...acc, [name]: 0}), {});
+        }
+
+        // Calculate total power contributed by active players
+        const totalPower = activePlayerNames.reduce((sum, name) => sum + (roundInputs[name]?.power || 0), 0);
+        
+        let netValues = 0; // Tracks the total loss incurred by non-showed, active players
         const roundScores = {};
 
-        playerNames.forEach((name, i) => {
-            const isShowed = i === showedPlayerIndex;
+        playerNames.forEach((name) => {
+            const isActive = activePlayerNames.includes(name);
+            const isShowed = name === showedPlayerName;
+            
+            // Inactive players always score 0 for the round
+            if (!isActive) {
+                roundScores[name] = 0.00;
+                return; 
+            }
+
             const input = roundInputs[name] || { power: 0, hands: 0 };
             const power = input.power;
             const hands = input.hands;
             let points = 0;
 
             if (!isShowed) {
-                // Non-Showed Player calculation (following original Python logic):
-                // points = (-1 * (total_power*20*per_point_value)) - (hands*10*per_point_value) + (power*20*(num_of_player)*per_point_value)
+                // Non-Showed, Active Player calculation (following original Python logic)
                 
                 // Loss component 1: Loss due to total power in the game
                 points -= (totalPower * 20 * perPointValue); 
@@ -287,7 +327,7 @@ const App = () => {
                 // Loss component 2: Loss due to hands taken
                 points -= (hands * 10 * perPointValue); 
                 
-                // Gain component: Gain due to own power * number of players
+                // Gain component: Gain due to own power * number of active players (since only active players pay/gain)
                 points += (power * 20 * numPlayers * perPointValue);
 
                 roundScores[name] = parseFloat(points.toFixed(2));
@@ -295,11 +335,11 @@ const App = () => {
             }
         });
 
-        // Showed Player calculation: Wins the total amount lost by others
-        roundScores[playerNames[showedPlayerIndex]] = parseFloat((-1 * netValues).toFixed(2));
+        // Showed Player calculation: Wins the total amount lost by active others
+        roundScores[showedPlayerName] = parseFloat((-1 * netValues).toFixed(2));
         
         return roundScores;
-    }, [currentGame, showedPlayerIndex, roundInputs]);
+    }, [currentGame, showedPlayerIndex, roundInputs, inactivePlayers]);
     // --- End of Calculation Logic ---
 
 
@@ -313,7 +353,8 @@ const App = () => {
 
         gameHistory.forEach(round => {
             currentGame.playerNames.forEach(name => {
-                const score = round.scores[name] || 0;
+                // Safely access score, defaulting to 0 if not present
+                const score = round.scores[name] || 0; 
                 scoresMap[name] += score;
             });
         });
@@ -334,18 +375,22 @@ const App = () => {
             setMessage("Cannot save: Game is not active or application is not ready.");
             return;
         }
-        
-        // Basic input validation: check if total hands taken by non-showed players is reasonable
-        // Note: The previous validation logic was incomplete, removing it for a simpler check
-        // that still ensures non-negative numbers were entered.
-        
+
         const scores = calculateRoundScores();
         
+        // Basic check to ensure the showed player wasn't inactive
+        const showedPlayerName = currentGame.playerNames[showedPlayerIndex];
+        if (inactivePlayers.includes(showedPlayerName)) {
+            setMessage("Error: The Showed Player cannot be marked as inactive for the round.");
+            return;
+        }
+
         const newRoundData = {
             scores: scores,
-            showedPlayer: currentGame.playerNames[showedPlayerIndex],
+            showedPlayer: showedPlayerName,
+            inactivePlayers: inactivePlayers, // Save inactive list for historical context
             perPointValue: currentGame.perPointValue,
-            roundDetails: roundInputs,
+            roundDetails: roundInputs, // Store all inputs (active and inactive 0s)
             timestamp: serverTimestamp(),
             savedBy: userId,
         };
@@ -362,13 +407,14 @@ const App = () => {
 
             setMessage('Round saved successfully! ✅');
             
-            // Clear inputs for next round
+            // Clear inputs and reset state for next round
             const newInputs = currentGame.playerNames.reduce((acc, name) => ({
                 ...acc,
                 [name]: { power: 0, hands: 0 }
             }), {});
             setRoundInputs(newInputs);
             setShowedPlayerIndex(0);
+            setInactivePlayers([]); // Reset inactive players for the next round
 
         } catch (error) {
             console.error("Error saving round:", error);
@@ -413,16 +459,49 @@ const App = () => {
         }));
     };
     
+    // --- New Feature: Add Player Logic ---
+    const handleAddNewPlayer = async (newPlayerName) => {
+        if (!db || !userId || !activeGameId || !newPlayerName.trim()) {
+            setMessage("Error: Cannot add player. Check name and connection.");
+            return;
+        }
+
+        const trimmedName = newPlayerName.trim();
+        if (currentGame.playerNames.map(n => n.toLowerCase()).includes(trimmedName.toLowerCase())) {
+            setMessage(`Error: Player "${trimmedName}" already exists.`);
+            return;
+        }
+
+        const gameDocRef = doc(db, `artifacts/${appId}/public/data/marriage_games/${activeGameId}`);
+        const updatedPlayerNames = [...currentGame.playerNames, trimmedName];
+        
+        try {
+            setMessage(`Adding player ${trimmedName}... ⏳`);
+            await withBackoff(() => updateDoc(gameDocRef, {
+                playerNames: updatedPlayerNames,
+                lastUpdated: serverTimestamp(),
+            }));
+            setMessage(`Player ${trimmedName} added successfully! They can join next round. ✅`);
+        } catch (error) {
+            console.error("Error adding new player:", error);
+            setMessage("Error adding new player. Check console.");
+        }
+    };
+
     // --- Components / Views ---
 
     // 5. GamePlay View
     const GamePlayView = () => {
+        const [newPlayerName, setNewPlayerName] = useState(''); // State for new player input
+
         if (!currentGame) {
             return <div className="text-center text-xl text-yellow-400 p-8">Loading game details...</div>;
         }
         
         const isGameDone = currentGame.status === 'done';
         const previewScores = calculateRoundScores();
+        
+        const activePlayerNames = currentGame.playerNames.filter(name => !inactivePlayers.includes(name));
 
         return (
             <>
@@ -443,29 +522,99 @@ const App = () => {
                         </button>
                     </div>
                 </div>
+                
+                {/* NEW: Add Player Section */}
+                {!isGameDone && (
+                    <div className="max-w-4xl w-full mx-auto bg-gray-800 p-6 rounded-xl shadow-2xl mb-8">
+                         <h3 className="text-xl font-bold mb-4 border-b border-gray-700 pb-2 text-pink-300">Add New Player</h3>
+                         <div className="flex space-x-3">
+                             <input
+                                 type="text"
+                                 value={newPlayerName}
+                                 onChange={(e) => setNewPlayerName(e.target.value)}
+                                 placeholder="Enter new player's name"
+                                 className="flex-grow p-3 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-indigo-500 focus:border-indigo-500"
+                             />
+                             <button
+                                 onClick={() => {
+                                     handleAddNewPlayer(newPlayerName);
+                                     setNewPlayerName(''); // Clear input after clicking
+                                 }}
+                                 disabled={!newPlayerName.trim() || currentGame.playerNames.length >= 8}
+                                 className="px-4 py-3 bg-indigo-500 hover:bg-indigo-600 text-white font-bold rounded-lg disabled:opacity-50 transition duration-150"
+                             >
+                                 Add Player
+                             </button>
+                         </div>
+                         {currentGame.playerNames.length >= 8 && <p className="text-sm text-yellow-400 mt-2">Maximum 8 players reached.</p>}
+                    </div>
+                )}
 
                 {/* New Round Input (Hidden if game is done) */}
                 {!isGameDone && (
                     <div className="max-w-4xl w-full mx-auto bg-gray-800 p-6 rounded-xl shadow-2xl mb-8">
-                        <h2 className="text-2xl font-bold mb-4 border-b border-gray-700 pb-2 text-indigo-300">New Round Data</h2>
+                        <h2 className="text-2xl font-bold mb-4 border-b border-gray-700 pb-2 text-indigo-300">New Round Setup</h2>
+
+                        {/* Active/Inactive Toggler */}
+                        <div className="mb-6">
+                            <label className="block text-lg font-medium text-gray-300 mb-2">Set Player Status (Click to Toggle)</label>
+                            <div className="flex flex-wrap gap-3">
+                                {currentGame.playerNames.map((name, index) => {
+                                    const isInactive = inactivePlayers.includes(name);
+                                    return (
+                                        <button
+                                            key={index}
+                                            onClick={() => toggleInactive(name)}
+                                            className={`flex items-center px-4 py-2 rounded-full font-semibold text-sm transition duration-150 ${
+                                                isInactive 
+                                                    ? 'bg-gray-600 text-gray-300 hover:bg-gray-500' 
+                                                    : 'bg-green-600 text-white hover:bg-green-700'
+                                            }`}
+                                        >
+                                            {name}
+                                            <span className="ml-2 text-xs">
+                                                {isInactive ? ' (SITTING OUT)' : ' (ACTIVE)'}
+                                            </span>
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                            <p className="text-sm text-gray-500 mt-2">Active Players This Round: **{activePlayerNames.length}**</p>
+                        </div>
                         
                         {/* Showed Player Selector */}
-                        <div className="mb-6">
+                        <div className="mb-6 border-t border-gray-700 pt-6">
                             <label className="block text-lg font-medium text-gray-300 mb-2">Showed Player</label>
                             <select
                                 value={showedPlayerIndex}
                                 onChange={(e) => setShowedPlayerIndex(parseInt(e.target.value, 10))}
                                 className="w-full p-3 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-indigo-500 focus:border-indigo-500"
                             >
-                                {currentGame.playerNames.map((name, index) => (
-                                    <option key={index} value={index}>{name}</option>
-                                ))}
+                                {currentGame.playerNames.map((name, index) => {
+                                    const isInactive = inactivePlayers.includes(name);
+                                    return (
+                                        <option 
+                                            key={index} 
+                                            value={index} 
+                                            disabled={isInactive} 
+                                            className={isInactive ? 'text-red-400' : 'text-white'}
+                                        >
+                                            {name} {isInactive ? '(Inactive)' : ''}
+                                        </option>
+                                    );
+                                })}
                             </select>
+                            {inactivePlayers.includes(currentGame.playerNames[showedPlayerIndex]) && (
+                                <p className="text-sm text-red-400 mt-1">Warning: Showed Player must be active.</p>
+                            )}
                         </div>
                         
-                        {/* Individual Player Inputs */}
+                        <h3 className="text-xl font-bold mb-4 border-b border-gray-700 pb-2 text-indigo-300 pt-2">Enter Hands and Power</h3>
+                        
+                        {/* Individual Player Inputs (Only for Active Players) */}
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            {currentGame.playerNames.map((name, index) => {
+                            {activePlayerNames.map((name) => {
+                                const index = currentGame.playerNames.indexOf(name);
                                 const isShowed = index === showedPlayerIndex;
                                 const input = roundInputs[name] || { power: 0, hands: 0 };
                                 
@@ -476,7 +625,7 @@ const App = () => {
                                             {isShowed && <span className="text-xs px-2 py-0.5 bg-indigo-500 rounded-full">SHOWED</span>}
                                         </h4>
                                         
-                                        {/* Power Input (for all) */}
+                                        {/* Power Input (for all active) */}
                                         <div className="mb-3">
                                             <label className="block text-sm text-gray-400 mb-1">Power ({name})</label>
                                             <input
@@ -488,7 +637,7 @@ const App = () => {
                                             />
                                         </div>
                                         
-                                        {/* Hands Input (only for non-showed) */}
+                                        {/* Hands Input (only for non-showed active) */}
                                         {!isShowed && (
                                             <div>
                                                 <label className="block text-sm text-gray-400 mb-1">Hands ({name})</label>
@@ -514,14 +663,14 @@ const App = () => {
                                     <div key={`preview-${name}`} className="bg-gray-700 p-3 rounded-lg text-center flex-grow min-w-[120px]">
                                         <p className="text-sm text-gray-400">{name}</p>
                                         <p className={`font-bold text-lg ${previewScores[name] >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                                            {previewScores[name] ? (previewScores[name] > 0 ? '+' : '') + previewScores[name].toFixed(2) : '0.00'}
+                                            {previewScores[name] !== undefined ? (previewScores[name] > 0 ? '+' : '') + previewScores[name].toFixed(2) : '0.00'}
                                         </p>
                                     </div>
                                 ))}
                             </div>
                             <button
                                 onClick={handleSaveRound}
-                                disabled={!db || isGameDone}
+                                disabled={!db || isGameDone || inactivePlayers.includes(currentGame.playerNames[showedPlayerIndex])}
                                 className="w-full py-3 bg-pink-600 hover:bg-pink-700 text-white font-bold rounded-lg shadow-lg disabled:opacity-50 transition duration-150"
                             >
                                 {db ? 'Calculate & Save Round' : 'Connecting to DB...'}
@@ -587,15 +736,23 @@ const App = () => {
                                                 <td className="px-3 py-3 whitespace-nowrap text-sm font-medium text-gray-300">
                                                     #{roundIndex + 1}
                                                     <span className="block text-xs text-indigo-400">({round.showedPlayer})</span>
+                                                    {round.inactivePlayers && round.inactivePlayers.length > 0 && (
+                                                        <span className="block text-xs text-yellow-400">({round.inactivePlayers.join(', ')} inactive)</span>
+                                                    )}
                                                 </td>
                                                 {currentGame.playerNames.map((name, playerIndex) => {
-                                                    const score = round.scores[name] || 0;
+                                                    const score = round.scores[name] !== undefined ? round.scores[name] : 0;
+                                                    const isInactiveInRound = round.inactivePlayers && round.inactivePlayers.includes(name);
                                                     return (
                                                         <td 
                                                             key={playerIndex} 
-                                                            className={`px-3 py-3 whitespace-nowrap text-sm font-semibold text-center ${score >= 0 ? 'text-green-400' : 'text-red-400'}`}
+                                                            className={`px-3 py-3 whitespace-nowrap text-sm font-semibold text-center ${
+                                                                isInactiveInRound 
+                                                                    ? 'text-gray-500 italic' 
+                                                                    : score >= 0 ? 'text-green-400' : 'text-red-400'
+                                                            }`}
                                                         >
-                                                            {score > 0 ? '+' : ''}{score.toFixed(2)}
+                                                            {isInactiveInRound ? 'N/A' : (score > 0 ? '+' : '') + score.toFixed(2)}
                                                         </td>
                                                     );
                                                 })}
