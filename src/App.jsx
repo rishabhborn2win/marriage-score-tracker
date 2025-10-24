@@ -7,7 +7,6 @@ import { getFirestore, doc, setDoc, collection, query, onSnapshot, orderBy, serv
 // IMPORTANT: These variables are provided automatically in the Canvas environment.
 // For local testing, you must replace the placeholders below with your own Firebase config.
 
-// 🚨 Step 3: This object contains the user's provided configuration.
 const LOCAL_FIREBASE_CONFIG = {
     apiKey: "AIzaSyAtA5djpuON6A2ZICy63exYkz7Wn-22wGA",
     authDomain: "marriage-card-game-tracker.firebaseapp.com",
@@ -110,13 +109,17 @@ const App = () => {
     // --- GAME DATA STATE (fetched from activeGameId) ---
     const [currentGame, setCurrentGame] = useState(null);
     const [gameHistory, setGameHistory] = useState([]); 
-
+    
     // --- INPUT STATE (for new round entry) ---
     const [showedPlayerIndex, setShowedPlayerIndex] = useState(0);
+    // Stores strings (e.g., '1' or '1.5') for input fields
     const [roundInputs, setRoundInputs] = useState({});
     
-    // NEW STATE: Tracks which players are inactive for the current round
+    // Tracks which players are inactive for the current round
     const [inactivePlayers, setInactivePlayers] = useState([]);
+    
+    // NEW STATE: Tracks which round is expanded in the mobile list view
+    const [expandedRoundId, setExpandedRoundId] = useState(null);
 
 
     // 0. Persist states to localStorage (Runs on view or activeGameId change)
@@ -203,12 +206,9 @@ const App = () => {
                 const gameData = docSnap.data();
                 setCurrentGame({ id: docSnap.id, ...gameData });
                 
-                // Initialize round inputs based on player names
-                const newInputs = gameData.playerNames.reduce((acc, name) => ({
-                    ...acc,
-                    [name]: { power: 0, hands: 0 }
-                }), {});
-                setRoundInputs(newInputs);
+                // Initialize round inputs to empty strings for controlled inputs
+                // We don't try to initialize every player here; we let the input logic handle defaults dynamically.
+                setRoundInputs({}); 
                 
                 // Reset showed player and inactive list when game data loads
                 setShowedPlayerIndex(0);
@@ -261,6 +261,7 @@ const App = () => {
         return () => unsubscribe();
     }, [db, isAuthReady, activeGameId, appId]);
     
+
     // --- Player Status Toggle ---
     const toggleInactive = (name) => {
         setInactivePlayers(prev => 
@@ -271,22 +272,23 @@ const App = () => {
         // Reset inputs for the toggled player just in case
         setRoundInputs(prev => ({
              ...prev,
-             [name]: { power: 0, hands: 0 }
+             // Ensure the specific player's input object is present before resetting its fields
+             [name]: { power: '', hands: '' } // Reset to empty string
         }));
     };
 
     // --- Core Calculation Logic ---
-    const calculateRoundScores = useCallback(() => {
-        if (!currentGame) return {};
-
-        const { playerNames, perPointValue } = currentGame;
+    const calculateRoundScores = useCallback((inputs = roundInputs, showedPlayerIdx = showedPlayerIndex, inactiveList = inactivePlayers, pointValue = currentGame?.perPointValue) => {
+        if (!currentGame || !pointValue) return {};
+        
+        const { playerNames } = currentGame;
         
         // Filter out inactive players for this round's calculation
-        const activePlayerNames = playerNames.filter(name => !inactivePlayers.includes(name));
+        const activePlayerNames = playerNames.filter(name => !inactiveList.includes(name));
         const numPlayers = activePlayerNames.length;
         
-        // Find the index of the showed player within the FULL playerNames list
-        const showedPlayerName = playerNames[showedPlayerIndex];
+        // Find the name of the showed player within the FULL playerNames list
+        const showedPlayerName = playerNames[showedPlayerIdx];
         
         // Check if the showed player is active
         const isShowedPlayerActive = activePlayerNames.includes(showedPlayerName);
@@ -297,8 +299,8 @@ const App = () => {
             return playerNames.reduce((acc, name) => ({...acc, [name]: 0}), {});
         }
 
-        // Calculate total power contributed by active players
-        const totalPower = activePlayerNames.reduce((sum, name) => sum + (roundInputs[name]?.power || 0), 0);
+        // Calculate total power contributed by active players (Parse strings to numbers here)
+        const totalPower = activePlayerNames.reduce((sum, name) => sum + (parseFloat(inputs[name]?.power) || 0), 0);
         
         let netValues = 0; // Tracks the total loss incurred by non-showed, active players
         const roundScores = {};
@@ -313,22 +315,25 @@ const App = () => {
                 return; 
             }
 
-            const input = roundInputs[name] || { power: 0, hands: 0 };
-            const power = input.power;
-            const hands = input.hands;
-            let points = 0;
-
             if (!isShowed) {
+                // Use || '' for safety when reading from inputs
+                const input = inputs[name] || { power: '', hands: '' };
+                // Parse strings to numbers for calculation
+                const power = parseFloat(input.power) || 0;
+                const hands = parseFloat(input.hands) || 0;
+
+                let points = 0;
+                
                 // Non-Showed, Active Player calculation (following original Python logic)
                 
                 // Loss component 1: Loss due to total power in the game
-                points -= (totalPower * 20 * perPointValue); 
+                points -= (totalPower * 20 * pointValue); 
                 
                 // Loss component 2: Loss due to hands taken
-                points -= (hands * 10 * perPointValue); 
+                points -= (hands * 10 * pointValue); 
                 
                 // Gain component: Gain due to own power * number of active players (since only active players pay/gain)
-                points += (power * 20 * numPlayers * perPointValue);
+                points += (power * 20 * numPlayers * pointValue);
 
                 roundScores[name] = parseFloat(points.toFixed(2));
                 netValues += points;
@@ -349,18 +354,19 @@ const App = () => {
             return [];
         }
 
+        // Calculate cumulative score from rounds
         const scoresMap = currentGame.playerNames.reduce((acc, name) => ({ ...acc, [name]: 0 }), {});
 
         gameHistory.forEach(round => {
             currentGame.playerNames.forEach(name => {
-                // Safely access score, defaulting to 0 if not present
                 const score = round.scores[name] || 0; 
                 scoresMap[name] += score;
             });
         });
-
+        
         const sortedScores = Object.keys(scoresMap).map(name => ({
             name,
+            // Score is the raw cumulative score from rounds
             score: parseFloat(scoresMap[name].toFixed(2))
         })).sort((a, b) => b.score - a.score); // Sort for leaderboard
 
@@ -385,12 +391,22 @@ const App = () => {
             return;
         }
 
+        // Convert roundInputs (which contains strings) to numbers for storage in Firestore
+        const numericalRoundDetails = currentGame.playerNames.reduce((acc, name) => {
+            acc[name] = {
+                power: parseFloat(roundInputs[name]?.power) || 0,
+                hands: parseFloat(roundInputs[name]?.hands) || 0,
+            };
+            return acc;
+        }, {});
+
+
         const newRoundData = {
             scores: scores,
             showedPlayer: showedPlayerName,
             inactivePlayers: inactivePlayers, // Save inactive list for historical context
             perPointValue: currentGame.perPointValue,
-            roundDetails: roundInputs, // Store all inputs (active and inactive 0s)
+            roundDetails: numericalRoundDetails, // Store numerical inputs
             timestamp: serverTimestamp(),
             savedBy: userId,
         };
@@ -408,11 +424,7 @@ const App = () => {
             setMessage('Round saved successfully! ✅');
             
             // Clear inputs and reset state for next round
-            const newInputs = currentGame.playerNames.reduce((acc, name) => ({
-                ...acc,
-                [name]: { power: 0, hands: 0 }
-            }), {});
-            setRoundInputs(newInputs);
+            setRoundInputs({}); // Clear to empty object
             setShowedPlayerIndex(0);
             setInactivePlayers([]); // Reset inactive players for the next round
 
@@ -447,19 +459,23 @@ const App = () => {
         }
     };
 
-    const handleInputChange = (name, field, value) => {
-        // Ensure inputs are non-negative integers
-        const numericValue = Math.max(0, parseInt(value, 10) || 0); 
+    const handleInputChange = useCallback((name, field, value) => {
+        // 1. Validation: Only allow empty string or valid decimal number format
+        if (!/^\d*\.?\d*$/.test(value)) {
+            return; // Reject invalid characters immediately
+        }
+        
+        // 2. Update state with the raw string value (This is the critical fix)
         setRoundInputs(prev => ({
             ...prev,
             [name]: {
-                ...prev[name],
-                [field]: numericValue
+                ...(prev[name] || {}), // Ensure existing object is merged, or start with empty object
+                [field]: value // Store the raw string input
             }
         }));
-    };
+    },[roundInputs]);
     
-    // --- New Feature: Add Player Logic ---
+    // --- Feature: Add Player Logic ---
     const handleAddNewPlayer = async (newPlayerName) => {
         if (!db || !userId || !activeGameId || !newPlayerName.trim()) {
             setMessage("Error: Cannot add player. Check name and connection.");
@@ -488,11 +504,317 @@ const App = () => {
         }
     };
 
+    // --- Feature: Modify Point Value Logic ---
+    const handleUpdatePointValue = async (newValue) => {
+        const numericValue = parseFloat(newValue);
+        if (!db || !userId || !activeGameId || isNaN(numericValue) || numericValue <= 0) {
+            setMessage("Error: Invalid point value. Must be a positive number.");
+            return;
+        }
+
+        if (numericValue === currentGame.perPointValue) {
+            setMessage("Point value is already set to that amount.");
+            return;
+        }
+
+        const gameDocRef = doc(db, `artifacts/${appId}/public/data/marriage_games/${activeGameId}`);
+        
+        try {
+            setMessage(`Updating point value to $${numericValue.toFixed(2)}... ⏳`);
+            await withBackoff(() => updateDoc(gameDocRef, {
+                perPointValue: numericValue,
+                lastUpdated: serverTimestamp(),
+            }));
+            setMessage(`Point value updated to $${numericValue.toFixed(2)} for future rounds. ✅`);
+        } catch (error) {
+            console.error("Error updating point value:", error);
+            setMessage("Error updating point value. Check console.");
+        }
+    };
+    
+    // --- Feature: Edit Round Score Logic ---
+    const handleEditRoundScore = async (roundId, updatedRoundDetails) => {
+        if (!db || !userId || !activeGameId || !roundId) {
+            setMessage("Cannot save edit: Application is not ready.");
+            return;
+        }
+        
+        const roundDocRef = doc(db, `artifacts/${appId}/public/data/marriage_games/${activeGameId}/rounds/${roundId}`);
+        
+        // 1. Calculate the NEW scores based on the edited inputs (which are strings in the modal)
+        const { showedPlayerIndex, inactivePlayers, perPointValue } = updatedRoundDetails;
+        
+        const newScores = calculateRoundScores(
+            updatedRoundDetails.rawRoundDetails, // The newly edited raw string hands/power
+            showedPlayerIndex,
+            inactivePlayers,
+            perPointValue
+        );
+        
+        // 2. Convert raw strings back to numerical format for storage in Firestore
+        const numericalRoundDetails = currentGame.playerNames.reduce((acc, name) => {
+            acc[name] = {
+                power: parseFloat(updatedRoundDetails.rawRoundDetails[name]?.power) || 0,
+                hands: parseFloat(updatedRoundDetails.rawRoundDetails[name]?.hands) || 0,
+            };
+            return acc;
+        }, {});
+
+
+        try {
+            setMessage('Updating round details and scores... ⏳');
+            await withBackoff(() => updateDoc(roundDocRef, {
+                scores: newScores, // Save the newly calculated scores
+                roundDetails: numericalRoundDetails, // Save the new numerical inputs
+                showedPlayer: currentGame.playerNames[showedPlayerIndex], // Update showed player name
+                showedPlayerIndex: showedPlayerIndex, // Save index for easy reference
+                inactivePlayers: inactivePlayers, // Save new inactive list
+                // Do not update timestamp, we keep the original for round ordering
+            }));
+
+            setMessage('Round edited and recalculated successfully! ✅');
+            
+            // Also update the parent document's lastUpdated field to trigger dashboard re-order
+            const gameDocRef = doc(db, `artifacts/${appId}/public/data/marriage_games/${activeGameId}`);
+            await withBackoff(() => updateDoc(gameDocRef, { lastUpdated: serverTimestamp() }));
+
+        } catch (error) {
+            console.error("Error updating round score:", error);
+            setMessage("Error updating round score. Check console.");
+        }
+    };
+
     // --- Components / Views ---
+
+    // Nested Component for editing a round's scores
+    const RoundEditModal = ({ round, onSave, onCancel, playerNames, gameHistory, calculateRoundScores }) => {
+        
+        const initialRoundIndex = playerNames.indexOf(round.showedPlayer);
+
+        // Convert stored numerical details to strings for the controlled inputs
+        const initialInputs = playerNames.reduce((acc, name) => ({
+            ...acc,
+            [name]: { 
+                power: (round.roundDetails[name]?.power || 0).toString(), 
+                hands: (round.roundDetails[name]?.hands || 0).toString() 
+            }
+        }), {});
+
+        const [editedInputs, setEditedInputs] = useState(initialInputs);
+        const [editedShowedPlayerIndex, setEditedShowedPlayerIndex] = useState(initialRoundIndex >= 0 ? initialRoundIndex : 0);
+        const [editedInactivePlayers, setEditedInactivePlayers] = useState(round.inactivePlayers || []);
+        
+        // Recalculate preview scores whenever inputs or status change in the modal
+        const previewScores = useMemo(() => {
+            return calculateRoundScores(
+                editedInputs, 
+                editedShowedPlayerIndex, 
+                editedInactivePlayers, 
+                round.perPointValue
+            );
+        }, [editedInputs, editedShowedPlayerIndex, editedInactivePlayers, round.perPointValue, calculateRoundScores]);
+
+        const handleInputEdit = (name, field, value) => {
+            // Validation: Only allow empty string or valid decimal number format
+            if (!/^\d*\.?\d*$/.test(value)) {
+                return; 
+            }
+            
+            setEditedInputs(prev => ({
+                ...prev,
+                [name]: {
+                    ...(prev[name] || {}), // Ensure player object exists
+                    [field]: value // Store raw string input
+                }
+            }));
+        };
+
+        const toggleInactiveEdit = (name) => {
+            setEditedInactivePlayers(prev => 
+                prev.includes(name) 
+                    ? prev.filter(n => n !== name) 
+                    : [...prev, name]             
+            );
+        };
+        
+        const handleSave = () => {
+            const updatedDetails = {
+                rawRoundDetails: editedInputs, // Pass the raw string inputs
+                showedPlayerIndex: editedShowedPlayerIndex,
+                inactivePlayers: editedInactivePlayers,
+                perPointValue: round.perPointValue,
+            };
+
+            onSave(round.id, updatedDetails);
+            onCancel(); // Close modal after save
+        };
+
+        if (!round) return null;
+        
+        const roundNumber = gameHistory.findIndex(h => h.id === round.id) + 1;
+        // const activePlayersForRound = playerNames.filter(name => !editedInactivePlayers.includes(name)); // Not needed
+
+        return (
+            <div className="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+                <div className="bg-gray-800 w-full max-w-2xl rounded-xl shadow-2xl p-6">
+                    <h3 className="text-2xl font-bold mb-4 text-pink-300">Edit Round #{roundNumber} Details</h3>
+                    <p className="text-sm text-gray-400 mb-4">Original Point Value: ${round.perPointValue.toFixed(2)}</p>
+
+                    <div className="space-y-4">
+                        {/* Showed Player Selector */}
+                        <div>
+                            <label className="block text-sm font-medium text-gray-300 mb-1">Showed Player</label>
+                            <select
+                                value={editedShowedPlayerIndex}
+                                onChange={(e) => setEditedShowedPlayerIndex(parseInt(e.target.value, 10))}
+                                className="w-full p-3 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-indigo-500 focus:border-indigo-500"
+                            >
+                                {playerNames.map((name, index) => {
+                                    const isInactive = editedInactivePlayers.includes(name);
+                                    return (
+                                        <option 
+                                            key={index} 
+                                            value={index} 
+                                            disabled={isInactive} 
+                                            className={isInactive ? 'text-red-400' : 'text-white'}
+                                        >
+                                            {name} {isInactive ? '(Inactive)' : ''}
+                                        </option>
+                                    );
+                                })}
+                            </select>
+                        </div>
+                        
+                        {/* Player Status Toggler */}
+                        <div>
+                            <label className="block text-sm font-medium text-gray-300 mb-2">Set Player Status</label>
+                            <div className="flex flex-wrap gap-2">
+                                {playerNames.map((name) => {
+                                    const isInactive = editedInactivePlayers.includes(name);
+                                    return (
+                                        <button
+                                            key={name}
+                                            onClick={() => toggleInactiveEdit(name)}
+                                            className={`px-3 py-1 rounded-full text-xs font-semibold transition ${
+                                                isInactive 
+                                                    ? 'bg-red-700 text-white hover:bg-red-600' 
+                                                    : 'bg-green-700 text-white hover:bg-green-600'
+                                            }`}
+                                        >
+                                            {name} ({isInactive ? 'OUT' : 'IN'})
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        </div>
+
+
+                        {/* Hands and Power Inputs (Raw Data) */}
+                        <div className="max-h-60 overflow-y-auto pr-2 border-t border-gray-700 pt-4">
+                            <p className="text-lg font-bold text-indigo-300 mb-2">Hands & Power Input:</p>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                {playerNames.map(name => {
+                                    const isShowed = name === playerNames[editedShowedPlayerIndex];
+                                    const isInactive = editedInactivePlayers.includes(name);
+                                    
+                                    // Use raw details for editing (now strings)
+                                    const power = editedInputs[name]?.power ?? '';
+                                    const hands = editedInputs[name]?.hands ?? '';
+
+                                    if (isInactive) return null; // Hide inactive players from input grid
+                                    
+                                    return (
+                                        <div key={name} className={`p-3 rounded-lg ${isShowed ? 'bg-indigo-900' : 'bg-gray-700'}`}>
+                                            <h4 className="font-semibold text-white mb-2">{name}</h4>
+                                            
+                                            {/* Power Input */}
+                                            <div className="mb-2">
+                                                <label className="block text-xs text-gray-400">Power</label>
+                                                <input
+                                                    type="text" 
+                                                    inputMode="decimal"
+                                                    value={power}
+                                                    onChange={(e) => handleInputEdit(name, 'power', e.target.value)}
+                                                    className="w-full p-2 rounded bg-gray-800 border border-gray-600 text-right text-sm"
+                                                />
+                                            </div>
+
+                                            {/* Hands Input (Not for Showed Player) */}
+                                            {!isShowed && (
+                                                <div>
+                                                    <label className="block text-xs text-gray-400">Hands</label>
+                                                    <input
+                                                        type="text" 
+                                                        inputMode="decimal"
+                                                        value={hands}
+                                                        onChange={(e) => handleInputEdit(name, 'hands', e.target.value)}
+                                                        className="w-full p-2 rounded bg-gray-800 border border-gray-600 text-right text-sm"
+                                                    />
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+
+                        {/* Recalculated Score Preview */}
+                        <div className="pt-4 border-t border-gray-700">
+                            <p className="text-lg font-bold text-pink-300 mb-2">Recalculated Scores:</p>
+                            <div className="flex flex-wrap gap-3">
+                                {playerNames.map(name => (
+                                    <div key={`preview-${name}`} className="bg-gray-700 p-2 rounded-lg text-center flex-grow min-w-[80px]">
+                                        <p className="text-xs text-gray-400">{name}</p>
+                                        <p className={`font-bold text-md ${previewScores[name] >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                            {(previewScores[name] > 0 ? '+' : '') + (previewScores[name] !== undefined ? previewScores[name].toFixed(2) : '0.00')}
+                                        </p>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+
+
+                    <div className="flex justify-end space-x-4 mt-6">
+                        <button 
+                            onClick={onCancel}
+                            className="px-4 py-2 bg-gray-500 hover:bg-gray-600 rounded-lg font-bold transition duration-150"
+                        >
+                            Cancel
+                        </button>
+                        <button
+                            onClick={handleSave}
+                            className="px-4 py-2 bg-pink-600 hover:bg-pink-700 rounded-lg font-bold transition duration-150"
+                        >
+                            Save & Recalculate
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
 
     // 5. GamePlay View
     const GamePlayView = () => {
         const [newPlayerName, setNewPlayerName] = useState(''); // State for new player input
+        const [newPointValue, setNewPointValue] = useState(currentGame?.perPointValue.toFixed(2) || '0.00'); // State for new point value input
+        
+        // --- State for Modals ---
+        const [roundToEdit, setRoundToEdit] = useState(null);
+        
+        const startEdit = (round) => setRoundToEdit(round);
+        const cancelEdit = () => setRoundToEdit(null);
+        // --- End State for Modals ---
+
+
+        useEffect(() => {
+            // Update the local input state when currentGame changes (e.g., when loaded or updated by others)
+            if (currentGame) {
+                setNewPointValue(currentGame.perPointValue.toFixed(2));
+            }
+        }, [currentGame]);
+
 
         if (!currentGame) {
             return <div className="text-center text-xl text-yellow-400 p-8">Loading game details...</div>;
@@ -502,17 +824,36 @@ const App = () => {
         const previewScores = calculateRoundScores();
         
         const activePlayerNames = currentGame.playerNames.filter(name => !inactivePlayers.includes(name));
+        
+        // Toggle function for mobile history
+        const toggleRoundExpansion = (id) => {
+            setExpandedRoundId(id === expandedRoundId ? null : id);
+        };
+
 
         return (
-            <>
+            <div className="relative">
+                
+                {/* Modals */}
+                {roundToEdit && (
+                    <RoundEditModal
+                        round={roundToEdit}
+                        onSave={handleEditRoundScore}
+                        onCancel={cancelEdit}
+                        playerNames={currentGame.playerNames}
+                        gameHistory={gameHistory}
+                        calculateRoundScores={calculateRoundScores} // Pass the calculator function
+                    />
+                )}
+                
                 {/* Game Info and Share ID */}
                 <div className="max-w-4xl w-full mx-auto bg-gray-700 p-4 rounded-xl shadow-inner mb-6">
                     <h2 className="text-2xl font-bold text-indigo-200">{currentGame.name}</h2>
-                    <p className="text-sm text-gray-400">Point Value: ${currentGame.perPointValue.toFixed(2)}</p>
+                    <p className="text-sm text-gray-400">Current Point Value: <span className="font-bold text-pink-400">${currentGame.perPointValue.toFixed(2)}</span></p>
                     <div className="flex items-center justify-between mt-2 p-2 bg-gray-800 rounded-lg">
                         <span className="text-sm font-mono text-pink-400 select-all">
                             Game Code: {currentGame.gameCode}
-                            <span className="ml-4 text-xs text-gray-500">({currentGame.id.substring(0, 8)}...)</span>
+                            <span className="ml-4 text-xs text-gray-500 hidden sm:inline">({currentGame.id.substring(0, 8)}...)</span>
                         </span>
                         <button
                             onClick={() => copyToClipboard(currentGame.gameCode, () => setMessage('Game Code copied!'))}
@@ -523,33 +864,224 @@ const App = () => {
                     </div>
                 </div>
                 
-                {/* NEW: Add Player Section */}
+                {/* ------------------------------------------------------------- */}
+                {/* 1. SCOREBOARD & HISTORY (MOVED TO THE TOP)                   */}
+                {/* ------------------------------------------------------------- */}
+                <div className="max-w-4xl w-full mx-auto bg-gray-800 p-6 rounded-xl shadow-2xl mb-8">
+                    <h2 className="text-2xl font-bold mb-4 border-b border-gray-700 pb-2 text-indigo-300">
+                        {isGameDone ? 'Final Leaderboard' : 'Current Scoreboard'}
+                    </h2>
+                    
+                    {/* Leaderboard Section (Optimized for Mobile) */}
+                    <div className="mb-6 space-y-2">
+                        {totalScores.map((player, index) => (
+                            <div key={player.name} className={`flex justify-between items-center p-3 rounded-lg ${index % 2 === 0 ? 'bg-gray-700/50' : 'bg-gray-700'}`}>
+                                <div className="flex items-center space-x-3">
+                                    <span className="text-xl font-extrabold w-8 text-center text-indigo-400">#{index + 1}</span>
+                                    <span className="text-lg font-semibold">{player.name}</span>
+                                </div>
+                                <span className={`text-xl font-extrabold text-right ${player.score >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                    {player.score > 0 ? '+' : ''}{player.score.toFixed(2)}
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+
+                    {/* Mark Done Button */}
+                    {!isGameDone && (
+                        <button
+                            onClick={handleMarkDone}
+                            className="w-full py-3 mt-4 bg-red-600 hover:bg-red-700 text-white font-bold rounded-lg shadow-lg disabled:opacity-50 transition duration-150"
+                            disabled={!db}
+                        >
+                            Mark Game as Done (Finalize Leaderboard)
+                        </button>
+                    )}
+
+                    {/* Round History (Optional) */}
+                    {gameHistory.length > 0 && (
+                        <div className="mt-8 pt-4 border-t border-gray-700">
+                            <h3 className="text-xl font-semibold mb-3 text-gray-300">Round History ({gameHistory.length} Rounds)</h3>
+
+                            {/* MOBILE LIST VIEW (Default for small screens) */}
+                            <div className="sm:hidden space-y-3">
+                                {gameHistory.map((round, roundIndex) => {
+                                    const isExpanded = round.id === expandedRoundId;
+                                    const roundNumber = roundIndex + 1;
+                                    
+                                    return (
+                                        <div key={round.id} className="bg-gray-700 rounded-lg shadow-md overflow-hidden">
+                                            {/* Header: Always visible */}
+                                            <div 
+                                                className="flex justify-between items-center p-4 cursor-pointer hover:bg-gray-600 transition"
+                                                onClick={() => toggleRoundExpansion(round.id)}
+                                            >
+                                                <div className="flex flex-col">
+                                                    <span className="font-bold text-lg text-pink-300">Round #{roundNumber}</span>
+                                                    <span className="text-sm text-gray-400">Showed: {round.showedPlayer}</span>
+                                                </div>
+                                                <div className="flex items-center space-x-2">
+                                                    <button
+                                                        onClick={(e) => { e.stopPropagation(); startEdit(round); }}
+                                                        disabled={isGameDone}
+                                                        className="text-xs px-3 py-1 bg-yellow-600 hover:bg-yellow-700 text-white rounded-lg disabled:opacity-50"
+                                                    >
+                                                        Edit
+                                                    </button>
+                                                    <span className="text-xl text-indigo-400">{isExpanded ? '▲' : '▼'}</span>
+                                                </div>
+                                            </div>
+
+                                            {/* Details: Collapsible */}
+                                            {isExpanded && (
+                                                <div className="p-4 pt-0 border-t border-gray-600">
+                                                    <p className="text-sm font-semibold text-gray-300 mb-2">Scores:</p>
+                                                    <div className="space-y-1">
+                                                        {currentGame.playerNames.map(name => {
+                                                            const score = round.scores[name] !== undefined ? round.scores[name] : 0;
+                                                            const isInactiveInRound = round.inactivePlayers && round.inactivePlayers.includes(name);
+                                                            
+                                                            return (
+                                                                <div key={name} className="flex justify-between text-sm py-1 border-b border-gray-700 last:border-b-0">
+                                                                    <span className="font-medium text-indigo-300">{name}</span>
+                                                                    <span className={`font-semibold ${
+                                                                        isInactiveInRound 
+                                                                            ? 'text-gray-500 italic' 
+                                                                            : score >= 0 ? 'text-green-400' : 'text-red-400'
+                                                                    }`}>
+                                                                        {isInactiveInRound ? 'N/A' : (score > 0 ? '+' : '') + score.toFixed(2)}
+                                                                    </span>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+
+                            {/* DESKTOP TABLE VIEW (Hidden on small screens) */}
+                            <div className="hidden sm:block overflow-x-auto rounded-lg border border-gray-700">
+                                <table className="min-w-full divide-y divide-gray-700">
+                                    <thead className="bg-gray-700 sticky top-0">
+                                        <tr>
+                                            <th className="px-3 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider min-w-[120px]"># / Showed</th>
+                                            {currentGame.playerNames.map((name, index) => (
+                                                <th key={index} className="px-3 py-3 text-center text-xs font-medium text-gray-300 uppercase tracking-wider min-w-[80px]">
+                                                    {name}
+                                                </th>
+                                            ))}
+                                            <th className="px-3 py-3 text-center text-xs font-medium text-gray-300 uppercase tracking-wider min-w-[80px]">Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-700">
+                                        {gameHistory.map((round, roundIndex) => (
+                                            <tr key={round.id} className="hover:bg-gray-700/50 transition duration-100">
+                                                <td className="px-3 py-3 whitespace-nowrap text-sm font-medium text-gray-300">
+                                                    #{roundIndex + 1}
+                                                    <span className="block text-xs text-indigo-400 font-normal">({round.showedPlayer})</span>
+                                                    {round.inactivePlayers && round.inactivePlayers.length > 0 && (
+                                                        <span className="block text-xs text-yellow-400 font-normal">({round.inactivePlayers.length} out)</span>
+                                                    )}
+                                                </td>
+                                                {currentGame.playerNames.map((name, playerIndex) => {
+                                                    const score = round.scores[name] !== undefined ? round.scores[name] : 0;
+                                                    const isInactiveInRound = round.inactivePlayers && round.inactivePlayers.includes(name);
+                                                    return (
+                                                        <td 
+                                                            key={playerIndex} 
+                                                            className={`px-3 py-3 whitespace-nowrap text-sm font-semibold text-center ${
+                                                                isInactiveInRound 
+                                                                    ? 'text-gray-500 italic' 
+                                                                    : score >= 0 ? 'text-green-400' : 'text-red-400'
+                                                            }`}
+                                                        >
+                                                            {isInactiveInRound ? 'N/A' : (score > 0 ? '+' : '') + score.toFixed(2)}
+                                                        </td>
+                                                    );
+                                                })}
+                                                <td className="px-3 py-3 whitespace-nowrap text-center">
+                                                    <button
+                                                        onClick={() => startEdit(round)}
+                                                        disabled={isGameDone}
+                                                        className="text-xs px-3 py-1 bg-yellow-600 hover:bg-yellow-700 text-white rounded-lg disabled:opacity-50"
+                                                    >
+                                                        Edit
+                                                    </button>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+
+                {/* ------------------------------------------------------------- */}
+                {/* 2. ROUND INPUTS (MOVED BELOW LEADERBOARD)                   */}
+                {/* ------------------------------------------------------------- */}
+                
+                {/* Feature Modifications (Only visible if game is not done) */}
                 {!isGameDone && (
-                    <div className="max-w-4xl w-full mx-auto bg-gray-800 p-6 rounded-xl shadow-2xl mb-8">
-                         <h3 className="text-xl font-bold mb-4 border-b border-gray-700 pb-2 text-pink-300">Add New Player</h3>
-                         <div className="flex space-x-3">
-                             <input
-                                 type="text"
-                                 value={newPlayerName}
-                                 onChange={(e) => setNewPlayerName(e.target.value)}
-                                 placeholder="Enter new player's name"
-                                 className="flex-grow p-3 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-indigo-500 focus:border-indigo-500"
-                             />
-                             <button
-                                 onClick={() => {
-                                     handleAddNewPlayer(newPlayerName);
-                                     setNewPlayerName(''); // Clear input after clicking
-                                 }}
-                                 disabled={!newPlayerName.trim() || currentGame.playerNames.length >= 8}
-                                 className="px-4 py-3 bg-indigo-500 hover:bg-indigo-600 text-white font-bold rounded-lg disabled:opacity-50 transition duration-150"
-                             >
-                                 Add Player
-                             </button>
-                         </div>
-                         {currentGame.playerNames.length >= 8 && <p className="text-sm text-yellow-400 mt-2">Maximum 8 players reached.</p>}
+                    <div className="max-w-4xl w-full mx-auto p-6 rounded-xl shadow-2xl mb-8 bg-gray-800">
+                        {/* Adjusted grid to stack vertically on mobile (default) and use 2 columns on medium screens */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6"> 
+                            {/* Add Player Section */}
+                            <div>
+                                <h3 className="text-xl font-bold mb-4 border-b border-gray-700 pb-2 text-pink-300">Add New Player</h3>
+                                <div className="flex flex-col space-y-3">
+                                    <input
+                                        type="text"
+                                        value={newPlayerName}
+                                        onChange={(e) => setNewPlayerName(e.target.value)}
+                                        placeholder="Enter name"
+                                        className="flex-grow p-3 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-indigo-500 focus:border-indigo-500"
+                                    />
+                                    <button
+                                        onClick={() => {
+                                            handleAddNewPlayer(newPlayerName);
+                                            setNewPlayerName(''); // Clear input after clicking
+                                        }}
+                                        disabled={!newPlayerName.trim() || currentGame.playerNames.length >= 8}
+                                        className="px-4 py-3 bg-indigo-500 hover:bg-indigo-600 text-white font-bold rounded-lg disabled:opacity-50 transition duration-150"
+                                    >
+                                        Add Player
+                                    </button>
+                                </div>
+                                {currentGame.playerNames.length >= 8 && <p className="text-sm text-yellow-400 mt-2">Max 8 players reached.</p>}
+                            </div>
+
+                            {/* Modify Point Value Section */}
+                            <div>
+                                <h3 className="text-xl font-bold mb-4 border-b border-gray-700 pb-2 text-pink-300">Modify Point Value</h3>
+                                <div className="flex flex-col space-y-3">
+                                    <input
+                                        type="number"
+                                        step="0.01"
+                                        min="0.01"
+                                        value={newPointValue}
+                                        onChange={(e) => setNewPointValue(e.target.value)}
+                                        placeholder="New Point Value ($)"
+                                        className="flex-grow p-3 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-indigo-500 focus:border-indigo-500"
+                                    />
+                                    <button
+                                        onClick={() => handleUpdatePointValue(newPointValue)}
+                                        disabled={newPointValue === currentGame.perPointValue.toFixed(2)}
+                                        className="px-4 py-3 bg-indigo-500 hover:bg-indigo-600 text-white font-bold rounded-lg disabled:opacity-50 transition duration-150"
+                                    >
+                                        Update Value
+                                    </button>
+                                </div>
+                                <p className="text-sm text-gray-400 mt-2">Applies to all subsequent rounds.</p>
+                            </div>
+                        </div>
                     </div>
                 )}
-
+                
                 {/* New Round Input (Hidden if game is done) */}
                 {!isGameDone && (
                     <div className="max-w-4xl w-full mx-auto bg-gray-800 p-6 rounded-xl shadow-2xl mb-8">
@@ -565,14 +1097,14 @@ const App = () => {
                                         <button
                                             key={index}
                                             onClick={() => toggleInactive(name)}
-                                            className={`flex items-center px-4 py-2 rounded-full font-semibold text-sm transition duration-150 ${
+                                            className={`flex items-center px-3 py-2 rounded-full font-semibold text-xs sm:text-sm transition duration-150 ${
                                                 isInactive 
                                                     ? 'bg-gray-600 text-gray-300 hover:bg-gray-500' 
                                                     : 'bg-green-600 text-white hover:bg-green-700'
                                             }`}
                                         >
                                             {name}
-                                            <span className="ml-2 text-xs">
+                                            <span className="ml-1 text-[10px] sm:text-xs">
                                                 {isInactive ? ' (SITTING OUT)' : ' (ACTIVE)'}
                                             </span>
                                         </button>
@@ -611,15 +1143,18 @@ const App = () => {
                         
                         <h3 className="text-xl font-bold mb-4 border-b border-gray-700 pb-2 text-indigo-300 pt-2">Enter Hands and Power</h3>
                         
-                        {/* Individual Player Inputs (Only for Active Players) */}
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {/* Individual Player Inputs (Optimized for 1 or 2 columns based on screen size) */}
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                             {activePlayerNames.map((name) => {
                                 const index = currentGame.playerNames.indexOf(name);
                                 const isShowed = index === showedPlayerIndex;
-                                const input = roundInputs[name] || { power: 0, hands: 0 };
+                                
+                                // Get the raw string values from state (FIX: Use nullish coalescing for safe rendering)
+                                const displayValuePower = roundInputs[name]?.power ?? '';
+                                const displayValueHands = roundInputs[name]?.hands ?? '';
                                 
                                 return (
-                                    <div key={index} className={`p-4 rounded-lg transition duration-150 ${isShowed ? 'bg-indigo-900 border border-indigo-500 shadow-md' : 'bg-gray-700 border border-gray-600'}`}>
+                                    <div key={name} className={`p-4 rounded-lg transition duration-150 ${isShowed ? 'bg-indigo-900 border border-indigo-500 shadow-md' : 'bg-gray-700 border border-gray-600'}`}>
                                         <h4 className="font-bold text-lg mb-2 flex justify-between items-center">
                                             {name} 
                                             {isShowed && <span className="text-xs px-2 py-0.5 bg-indigo-500 rounded-full">SHOWED</span>}
@@ -629,9 +1164,9 @@ const App = () => {
                                         <div className="mb-3">
                                             <label className="block text-sm text-gray-400 mb-1">Power ({name})</label>
                                             <input
-                                                type="number"
-                                                min="0"
-                                                value={input.power}
+                                                type="text" 
+                                                inputMode="decimal"
+                                                value={displayValuePower}
                                                 onChange={(e) => handleInputChange(name, 'power', e.target.value)}
                                                 className="w-full p-2 rounded bg-gray-800 border border-gray-600 focus:ring-pink-500 focus:border-pink-500"
                                             />
@@ -642,9 +1177,9 @@ const App = () => {
                                             <div>
                                                 <label className="block text-sm text-gray-400 mb-1">Hands ({name})</label>
                                                 <input
-                                                    type="number"
-                                                    min="0"
-                                                    value={input.hands}
+                                                    type="text" 
+                                                    inputMode="decimal"
+                                                    value={displayValueHands}
                                                     onChange={(e) => handleInputChange(name, 'hands', e.target.value)}
                                                     className="w-full p-2 rounded bg-gray-800 border border-gray-600 focus:ring-pink-500 focus:border-pink-500"
                                                 />
@@ -678,93 +1213,7 @@ const App = () => {
                         </div>
                     </div>
                 )}
-                
-                {/* Score History and Leaderboard */}
-                <div className="max-w-4xl w-full mx-auto bg-gray-800 p-6 rounded-xl shadow-2xl">
-                    <h2 className="text-2xl font-bold mb-4 border-b border-gray-700 pb-2 text-indigo-300">
-                        {isGameDone ? 'Final Leaderboard' : 'Current Scoreboard'}
-                    </h2>
-                    
-                    {/* Leaderboard Table */}
-                    <div className="mb-6">
-                        <div className="flex justify-between items-center py-2 px-3 bg-gray-700 rounded-t-lg font-bold text-sm text-gray-300">
-                            <span className="w-1/3">Rank</span>
-                            <span className="w-1/3 text-left">Player</span>
-                            <span className="w-1/3 text-right">Score</span>
-                        </div>
-                        {totalScores.map((player, index) => (
-                            <div key={player.name} className={`flex justify-between items-center p-3 border-b border-gray-700 ${index % 2 === 0 ? 'bg-gray-800' : 'bg-gray-700/50'}`}>
-                                <span className="w-1/3 text-lg font-extrabold text-indigo-400">#{index + 1}</span>
-                                <span className="w-1/3 text-lg font-semibold">{player.name}</span>
-                                <span className={`w-1/3 text-lg font-extrabold text-right ${player.score >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                                    {player.score > 0 ? '+' : ''}{player.score.toFixed(2)}
-                                </span>
-                            </div>
-                        ))}
-                    </div>
-
-                    {/* Mark Done Button */}
-                    {!isGameDone && (
-                        <button
-                            onClick={handleMarkDone}
-                            className="w-full py-3 mt-4 bg-red-600 hover:bg-red-700 text-white font-bold rounded-lg shadow-lg disabled:opacity-50 transition duration-150"
-                            disabled={!db}
-                        >
-                            Mark Game as Done (Finalize Leaderboard)
-                        </button>
-                    )}
-
-                    {/* Round History (Optional) */}
-                    {gameHistory.length > 0 && (
-                        <div className="mt-8 pt-4 border-t border-gray-700">
-                            <h3 className="text-xl font-semibold mb-3 text-gray-300">Round History ({gameHistory.length} Rounds)</h3>
-                            <div className="overflow-x-auto">
-                                <table className="min-w-full divide-y divide-gray-700">
-                                    <thead className="bg-gray-700">
-                                        <tr>
-                                            <th className="px-3 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider rounded-tl-lg"># / Showed</th>
-                                            {currentGame.playerNames.map((name, index) => (
-                                                <th key={index} className="px-3 py-3 text-center text-xs font-medium text-gray-300 uppercase tracking-wider">
-                                                    {name}
-                                                </th>
-                                            ))}
-                                        </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-gray-700">
-                                        {gameHistory.map((round, roundIndex) => (
-                                            <tr key={round.id} className="hover:bg-gray-700/50 transition duration-100">
-                                                <td className="px-3 py-3 whitespace-nowrap text-sm font-medium text-gray-300">
-                                                    #{roundIndex + 1}
-                                                    <span className="block text-xs text-indigo-400">({round.showedPlayer})</span>
-                                                    {round.inactivePlayers && round.inactivePlayers.length > 0 && (
-                                                        <span className="block text-xs text-yellow-400">({round.inactivePlayers.join(', ')} inactive)</span>
-                                                    )}
-                                                </td>
-                                                {currentGame.playerNames.map((name, playerIndex) => {
-                                                    const score = round.scores[name] !== undefined ? round.scores[name] : 0;
-                                                    const isInactiveInRound = round.inactivePlayers && round.inactivePlayers.includes(name);
-                                                    return (
-                                                        <td 
-                                                            key={playerIndex} 
-                                                            className={`px-3 py-3 whitespace-nowrap text-sm font-semibold text-center ${
-                                                                isInactiveInRound 
-                                                                    ? 'text-gray-500 italic' 
-                                                                    : score >= 0 ? 'text-green-400' : 'text-red-400'
-                                                            }`}
-                                                        >
-                                                            {isInactiveInRound ? 'N/A' : (score > 0 ? '+' : '') + score.toFixed(2)}
-                                                        </td>
-                                                    );
-                                                })}
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    )}
-                </div>
-            </>
+            </div>
         );
     };
 
@@ -974,8 +1423,8 @@ const App = () => {
                             </p>
                         ) : (
                             filteredGames.map(game => (
-                                <div key={game.id} className="p-4 bg-gray-700 rounded-lg flex justify-between items-center hover:bg-gray-600 transition duration-150">
-                                    <div>
+                                <div key={game.id} className="p-4 bg-gray-700 rounded-lg flex flex-col sm:flex-row justify-between items-start sm:items-center hover:bg-gray-600 transition duration-150">
+                                    <div className="mb-2 sm:mb-0">
                                         <p className="text-xl font-semibold text-white">{game.name}</p>
                                         <p className="text-sm text-gray-400">Code: <span className="font-mono text-pink-400">{game.gameCode || 'N/A'}</span> | Players: {game.playerNames.join(', ')}</p>
                                         <p className="text-xs text-gray-500 mt-1">ID: {game.id.substring(0, 8)}...</p>
@@ -985,7 +1434,7 @@ const App = () => {
                                             setActiveGameId(game.id);
                                             setView('gameplay');
                                         }}
-                                        className="px-4 py-2 bg-pink-500 hover:bg-pink-600 rounded-lg font-bold transition duration-150"
+                                        className="px-4 py-2 bg-pink-500 hover:bg-pink-600 rounded-lg font-bold transition duration-150 w-full sm:w-auto"
                                     >
                                         {filter === 'active' ? 'Resume' : 'View Leaderboard'}
                                     </button>
@@ -1063,14 +1512,7 @@ const App = () => {
             {/* Custom styles for appearance tweaks: */}
             <style>{`
                 .font-inter { font-family: 'Inter', sans-serif; }
-                input[type="number"]::-webkit-inner-spin-button, 
-                input[type="number"]::-webkit-outer-spin-button { 
-                    -webkit-appearance: none; 
-                    margin: 0; 
-                }
-                input[type="number"] {
-                    -moz-appearance: textfield;
-                }
+                /* Removed specific number input style overrides as we now use type="text" for decimal input */
             `}</style>
             
             {/* Outer wrapper for header and content */}
